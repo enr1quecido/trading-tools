@@ -10,7 +10,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright (c) 2026 Enrique Briceno"
 #property link      "https://github.com/enr1quecido/trading-tools"
-#property version   "1.00"
+#property version   "1.01"
 #property description "Shows today's realized net P/L and number of entries."
 #property indicator_chart_window
 #property indicator_buffers 0
@@ -19,7 +19,12 @@
 //--- Account-wide totals by default. When enabled, use the chart symbol.
 input bool InpCurrentSymbolOnly = false; // Count current chart symbol only
 
-//--- Display settings fixed to the requested appearance.
+//--- Configurable font. Arial and bottom-left position remain fixed.
+input group "Font appearance"
+input int   InpFontSize  = 10;       // Font size (6-150)
+input color InpFontColor = clrBlack; // Font color
+
+//--- Display state.
 string g_label_name     = "";
 string g_last_text      = "";
 bool   g_error_reported = false;
@@ -178,7 +183,14 @@ void RefreshDisplay()
 //+------------------------------------------------------------------+
 int OnInit()
   {
-   IndicatorSetString(INDICATOR_SHORTNAME,"Profit & Trades");
+   // Let MT5 use the exact .mq5 file name as the indicator short name.
+   // Setting the same short name explicitly makes some MT5 lists repeat
+   // it in parentheses after the file name.
+   if(InpFontSize<6 || InpFontSize>150)
+     {
+      Print("Profit & Trades: Font size must be between 6 and 150.");
+      return INIT_PARAMETERS_INCORRECT;
+     }
 
    // Unique object name so multiple copies do not remove each other.
    g_label_name="ProfitTrades_"+IntegerToString(ChartID())+"_"+
@@ -196,8 +208,8 @@ int OnInit()
    ObjectSetInteger(0,g_label_name,OBJPROP_XDISTANCE,10);
    ObjectSetInteger(0,g_label_name,OBJPROP_YDISTANCE,10);
    ObjectSetString (0,g_label_name,OBJPROP_FONT,"Arial");
-   ObjectSetInteger(0,g_label_name,OBJPROP_FONTSIZE,8);
-   ObjectSetInteger(0,g_label_name,OBJPROP_COLOR,clrBlack);
+   ObjectSetInteger(0,g_label_name,OBJPROP_FONTSIZE,InpFontSize);
+   ObjectSetInteger(0,g_label_name,OBJPROP_COLOR,InpFontColor);
    ObjectSetInteger(0,g_label_name,OBJPROP_BACK,false);
    ObjectSetInteger(0,g_label_name,OBJPROP_SELECTABLE,false);
    ObjectSetInteger(0,g_label_name,OBJPROP_HIDDEN,true);
