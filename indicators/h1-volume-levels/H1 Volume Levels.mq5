@@ -12,7 +12,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright (c) 2026 Enrique Briceno"
 #property link      "https://github.com/enr1quecido/trading-tools"
-#property version   "1.24"
+#property version   "1.26"
 #property description "H1 Volume Levels by Enrique Briceno"
 #property strict
 #property indicator_chart_window
@@ -66,8 +66,10 @@ input ENUM_LINE_STYLE ThirdLineStyle = STYLE_DOT;
 input group "Appearance"
 input bool ShowLevelText = true;                // Show or hide all three text labels
 input int TextFontSize = 9;
+input int LabelRightMarginPx = 72;            // Pixels from chart right edge (includes price scale)
 input int LineWidth = 1;                       // Non-solid MT5 lines use width 1
 
+string g_instancePrefix="";
 string g_levelNames[3];
 string g_labelNames[3];
 datetime g_activeDay=0;
@@ -256,13 +258,25 @@ bool GetReference(datetime &referenceDay,datetime &asOf)
    return referenceDay>0;
   }
 
+// Remove only objects created by THIS indicator instance, including
+// OBJ_TREND lines and OBJ_LABEL text. ObjectsDeleteAll is synchronous.
 void DeleteLevels()
   {
-   for(int i=0;i<3;i++)
-     {
-      if(g_levelNames[i]!="")ObjectDelete(0,g_levelNames[i]);
-      if(g_labelNames[i]!="")ObjectDelete(0,g_labelNames[i]);
-     }
+   if(g_instancePrefix!="")
+      ObjectsDeleteAll(0,g_instancePrefix,0,-1);
+  }
+
+// One-time migration: earlier builds created hidden chart objects with
+// randomly generated names. Removing the indicator could leave them orphaned.
+// These two exact prefixes belong only to old H1 Volume/Close Levels builds.
+// This does NOT remove user drawings or other indicators' objects.
+void CleanLegacyH1Objects()
+  {
+   int previous=ObjectsDeleteAll(0,"H1VolumeLevels_",0,-1);
+   previous+=ObjectsDeleteAll(0,"H1CloseLevels_",0,-1);
+   previous+=ObjectsDeleteAll(0,"H1VLevels126_",0,-1);
+   if(previous>0)
+      PrintFormat("H1 Volume Levels v1.26: removed %d orphaned legacy objects",previous);
   }
 
 bool DrawLevel(int index,datetime closingServerTime,double price,string type)
@@ -293,25 +307,70 @@ bool DrawLevel(int index,datetime closingServerTime,double price,string type)
                                 TimeToString(closingServerTime,TIME_DATE|TIME_MINUTES),
                                 DoubleToString(price,_Digits)));
 
+   // Label placement is handled separately in PositionPriceLabel().
+   // OBJ_LABEL is pixel-anchored, not tied to a historical candle time.
+   return true;
+  }
+
+// Position a label at the right edge of the CURRENT chart, directly above
+// its level. Convert the LEVEL PRICE to a screen Y coordinate using MT5.
+// Unlike OBJ_TEXT, OBJ_LABEL cannot jump back to the candle's left edge.
+bool PositionPriceLabel(const int index)
+  {
+   string line=g_levelNames[index];
    string label=g_labelNames[index];
    string caption=LevelText(index);
-   if(!ShowLevelText || caption=="")
+   if(!ShowLevelText || caption=="" || ObjectFind(0,line)<0)
      {
-      ObjectDelete(0,label);
-      return true;
+      if(ObjectFind(0,label)>=0)ObjectDelete(0,label);
+      return false;
      }
-   datetime labelTime=closingServerTime+300;
-   if(labelTime>=lineEnd)labelTime=closingServerTime;
+
+   int totalBars=Bars(_Symbol,_Period);
+   if(totalBars<=0)return false;
+   long firstVisible=ChartGetInteger(0,CHART_FIRST_VISIBLE_BAR,0);
+   if(firstVisible<0)firstVisible=0;
+   if(firstVisible>=totalBars)firstVisible=totalBars-1;
+   datetime visibleTime=iTime(_Symbol,_Period,(int)firstVisible);
+   if(visibleTime<=0)return false;
+
+   double price=ObjectGetDouble(0,line,OBJPROP_PRICE,0);
+   int x=0,y=0;
+   if(!ChartTimePriceToXY(0,0,visibleTime,price,x,y))
+     {
+      if(ObjectFind(0,label)>=0)ObjectDelete(0,label);
+      return false;
+     }
+
+   // Avoid showing labels off-screen when their price level is not visible.
+   long height=ChartGetInteger(0,CHART_HEIGHT_IN_PIXELS,0);
+   if(height<=0 || y<5 || y>=(int)height-5)
+     {
+      if(ObjectFind(0,label)>=0)ObjectDelete(0,label);
+      return false;
+     }
+
    if(ObjectFind(0,label)<0)
      {
-      if(!ObjectCreate(0,label,OBJ_TEXT,0,labelTime,price))return true;
+      ResetLastError();
+      if(!ObjectCreate(0,label,OBJ_LABEL,0,0,0))
+        {
+         PrintFormat("H1 Volume Levels: label creation failed (%d)",GetLastError());
+         return false;
+        }
      }
-   else ObjectMove(0,label,0,labelTime,price);
+
+   int top=y-3;
+   if(top<0)top=0;
+   ObjectSetInteger(0,label,OBJPROP_CORNER,CORNER_RIGHT_UPPER);
+   ObjectSetInteger(0,label,OBJPROP_ANCHOR,ANCHOR_RIGHT_LOWER);
+   ObjectSetInteger(0,label,OBJPROP_XDISTANCE,LabelRightMarginPx);
+   ObjectSetInteger(0,label,OBJPROP_YDISTANCE,top);
    ObjectSetString(0,label,OBJPROP_TEXT,caption);
    ObjectSetString(0,label,OBJPROP_FONT,"Arial");
    ObjectSetInteger(0,label,OBJPROP_FONTSIZE,TextFontSize);
    ObjectSetInteger(0,label,OBJPROP_COLOR,LevelColor(index));
-   ObjectSetInteger(0,label,OBJPROP_ANCHOR,ANCHOR_LEFT_LOWER);
+   ObjectSetInteger(0,label,OBJPROP_BACK,false);
    ObjectSetInteger(0,label,OBJPROP_SELECTABLE,false);
    ObjectSetInteger(0,label,OBJPROP_HIDDEN,true);
    return true;
@@ -351,7 +410,10 @@ void UpdateLevels()
       changed=true;
      }
    for(int i=0;i<3;i++)
+     {
       if(DrawH1DirectionalLevel(i,asOf))changed=true;
+      if(PositionPriceLabel(i))changed=true;
+     }
    if(changed)ChartRedraw(0);
   }
 
@@ -365,17 +427,20 @@ int OnInit()
       SecondCloseHour==ThirdCloseHour ||
       BrokerWinterUTCOffsetHours< -12 || BrokerWinterUTCOffsetHours>14 ||
       BrokerSummerUTCOffsetHours< -12 || BrokerSummerUTCOffsetHours>14 ||
-      LineWidth<1 || LineWidth>5 || TextFontSize<6 || TextFontSize>36)
+      LineWidth<1 || LineWidth>5 || TextFontSize<6 || TextFontSize>36 ||
+      LabelRightMarginPx<0 || LabelRightMarginPx>500)
      {
       Print("H1 Volume Levels: invalid inputs (hours 1-23, distinct, width 1-5).");
       return INIT_PARAMETERS_INCORRECT;
      }
-   string prefix="H1VolumeLevels_"+IntegerToString(ChartID())+"_"+
-                 IntegerToString((long)GetTickCount())+"_";
+   CleanLegacyH1Objects();
+   // Unique prefix for this running instance. OnDeinit deletes ALL its objects.
+   g_instancePrefix="H1VLevels126_"+IntegerToString(ChartID())+"_"+
+                    IntegerToString((long)GetTickCount())+"_";
    for(int i=0;i<3;i++)
      {
-      g_levelNames[i]=prefix+"LINE_"+IntegerToString(i+1);
-      g_labelNames[i]=prefix+"TEXT_"+IntegerToString(i+1);
+      g_levelNames[i]=g_instancePrefix+"LINE_"+IntegerToString(i+1);
+      g_labelNames[i]=g_instancePrefix+"LABEL_"+IntegerToString(i+1);
      }
    // No INDICATOR_SHORTNAME: Indicators List displays only H1 Volume Levels.
    EventSetTimer(2);
