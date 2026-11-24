@@ -2,282 +2,382 @@
 //| H1 Volume Levels.mq5                                             |
 //| Author: Enrique Briceno                                          |
 //| Copyright (c) 2026 Enrique Briceno                               |
-//| License: MIT (see LICENSE file)                                   |
+//| License: MIT (see LICENSE file)                                  |
 //| GitHub: https://github.com/enr1quecido/trading-tools             |
 //|                                                                  |
-//| Draws bullish H1 highs and bearish H1 lows on the chart.        |
-//| Uses H1 data independently of the chart timeframe.               |
-//| This indicator does not execute or manage trades.                |
+//| Three configurable H1 candle levels with editable chart labels. |
+//| Bullish H1: HIGH; bearish H1: LOW; doji: no level.               |
+//| Can use Berlin local time (CET/CEST) or broker-server time.      |
+//| This indicator does not execute or manage trades.               |
 //+------------------------------------------------------------------+
 #property copyright "Copyright (c) 2026 Enrique Briceno"
 #property link      "https://github.com/enr1quecido/trading-tools"
-#property version   "1.22"
+#property version   "1.24"
 #property description "H1 Volume Levels by Enrique Briceno"
 #property strict
 #property indicator_chart_window
 #property indicator_buffers 0
 #property indicator_plots   0
 
-// Select the trading day currently in view when reviewing past charts.
-// Alternatively, show only the broker's actual calendar day.
 enum ENUM_LEVEL_DAY_MODE
   {
-   VISIBLE_CHART_DAY = 0,     // Date currently being viewed (recommended)
-   BROKER_TODAY      = 1      // Current broker-server calendar date only
+   VISIBLE_CHART_DAY = 0,  // Date currently being viewed (recommended)
+   BROKER_TODAY      = 1   // Current broker-server calendar day
   };
 
-input ENUM_LEVEL_DAY_MODE DayMode        = VISIBLE_CHART_DAY;
-input int                 FirstCloseHour = 9;             // First H1 closing time (server time)
-input int                 SecondCloseHour= 10;            // Second H1 closing time (server time)
-input color               FirstLineColor = clrBlue;      // First H1 high/low line
-input color               SecondLineColor= clrBlue;       // Second H1 high/low line
-input ENUM_LINE_STYLE     FirstLineStyle = STYLE_SOLID;
-input ENUM_LINE_STYLE     SecondLineStyle= STYLE_SOLID;
-input int                 LineWidth      = 1;             // Width 1 preserves dashed style
-
-string   g_firstObject  = "";
-string   g_secondObject = "";
-datetime g_activeDay    = 0;
-
-//+------------------------------------------------------------------+
-//| Return midnight for a timestamp on the broker's calendar.       |
-//+------------------------------------------------------------------+
-datetime DayStart(const datetime when)
+enum ENUM_LEVEL_CLOCK
   {
-   if(when <= 0)
-      return 0;
+   LEVEL_BERLIN_TIME = 0,  // Berlin local time, adjusts CET / CEST
+   LEVEL_BROKER_TIME = 1   // Broker-server time, no conversion
+  };
 
-   MqlDateTime parts;
-   if(!TimeToStruct(when, parts))
-      return 0;
-   parts.hour = 0;
-   parts.min  = 0;
-   parts.sec  = 0;
-   return StructToTime(parts);
+enum ENUM_BROKER_OFFSET_MODE
+  {
+   OFFSET_AUTO_LIVE = 0,   // Live: compare trade server with UTC PC clock
+   OFFSET_MANUAL    = 1    // Manual offsets for tester / historical checks
+  };
+
+input group "Time settings"
+input ENUM_LEVEL_DAY_MODE DayMode = VISIBLE_CHART_DAY;
+input ENUM_LEVEL_CLOCK TimeReference = LEVEL_BERLIN_TIME; // Which clock defines 08:00/09:00/10:00?
+input ENUM_BROKER_OFFSET_MODE BrokerUTCOffsetMode = OFFSET_AUTO_LIVE;
+input int BrokerWinterUTCOffsetHours = 2;       // Used in MANUAL mode (e.g. UTC+2)
+input int BrokerSummerUTCOffsetHours = 3;       // Used in MANUAL mode (e.g. UTC+3)
+input bool BrokerUsesEuropeanDST = true;        // Historical DST assumption
+
+input group "Level 1"
+input int FirstCloseHour = 8;                   // H1 closing hour (selected clock)
+input string FirstLevelText = "Vol 8 AM";       // Editable text shown on level 1
+input color FirstLineColor = clrMagenta;
+input ENUM_LINE_STYLE FirstLineStyle = STYLE_DOT;
+
+input group "Level 2"
+input int SecondCloseHour = 9;                  // H1 closing hour (selected clock)
+input string SecondLevelText = "Vol 9 AM";      // Editable text shown on level 2
+input color SecondLineColor = clrMagenta;
+input ENUM_LINE_STYLE SecondLineStyle = STYLE_DOT;
+
+input group "Level 3"
+input int ThirdCloseHour = 10;                  // H1 closing hour (selected clock)
+input string ThirdLevelText = "Vol 10 AM";      // Editable text shown on level 3
+input color ThirdLineColor = clrMagenta;
+input ENUM_LINE_STYLE ThirdLineStyle = STYLE_DOT;
+
+input group "Appearance"
+input bool ShowLevelText = true;                // Show or hide all three text labels
+input int TextFontSize = 9;
+input int LineWidth = 1;                       // Non-solid MT5 lines use width 1
+
+string g_levelNames[3];
+string g_labelNames[3];
+datetime g_activeDay=0;
+int g_currentBrokerOffset=0;
+datetime g_currentUTC=0;
+int g_clockStatus=0;
+
+// Broker/UTC time values are represented as civil timestamps.
+datetime CivilTime(int year,int month,int day,int hour=0,int minute=0)
+  {
+   MqlDateTime t={};
+   t.year=year;t.mon=month;t.day=day;t.hour=hour;t.min=minute;
+   return StructToTime(t);
   }
 
-//+------------------------------------------------------------------+
-//| Use server time for live bars; historical view uses bar times.   |
-//+------------------------------------------------------------------+
-datetime BrokerNow()
+datetime DayStart(datetime moment)
   {
-   datetime t = TimeTradeServer();
-   if(t <= 0)
-      t = TimeCurrent();
-   return t;
+   if(moment<=0)return 0;
+   MqlDateTime d={};
+   if(!TimeToStruct(moment,d))return 0;
+   return CivilTime(d.year,d.mon,d.day);
   }
 
-//+------------------------------------------------------------------+
-//| Pick a chart-visible trading day and the latest visible time.    |
-//| This also works when the chart is scrolled to history.           |
-//+------------------------------------------------------------------+
-bool GetReference(datetime &referenceDay, datetime &asOf)
+int LastSunday(int year,int month)
   {
-   referenceDay = 0;
-   asOf = 0;
-
-   datetime now = BrokerNow();
-   if(DayMode == BROKER_TODAY)
-     {
-      referenceDay = DayStart(now);
-      asOf = now;
-      return (referenceDay > 0 && asOf > 0);
-     }
-
-   // The leftmost visible bar has the largest timeseries index.
-   // Subtracting the number of visible bars finds the rightmost one.
-   long firstVisible = ChartGetInteger(0, CHART_FIRST_VISIBLE_BAR, 0);
-   long visibleCount = ChartGetInteger(0, CHART_VISIBLE_BARS, 0);
-   int rightShift = 0;
-   if(firstVisible >= 0 && visibleCount > 0)
-     {
-      long shift = firstVisible - visibleCount + 1;
-      if(shift > 0)
-         rightShift = (int)shift;
-     }
-
-   int bars = Bars(_Symbol, _Period);
-   if(bars <= 0)
-      return false;
-   if(rightShift >= bars)
-      rightShift = bars - 1;
-
-   datetime rightTime = iTime(_Symbol, _Period, rightShift);
-   if(rightTime <= 0)
-      return false;
-
-   referenceDay = DayStart(rightTime);
-   int barDuration = PeriodSeconds(_Period);
-   if(barDuration <= 0)
-      barDuration = 60;
-
-   // Historical bars are already closed. The live bar may be forming.
-   asOf = rightTime + barDuration;
-   if(rightShift == 0 && now > 0 && now < asOf)
-      asOf = now;
-
-   // When reviewing history and the right edge crosses just after
-   // midnight, keep the previous day if its first level is in view.
-   // Do not use this fallback at the live edge: a new day starts clean.
-   if(rightShift > 0 && rightTime < referenceDay + FirstCloseHour * 3600)
-     {
-      int leftShift = (int)firstVisible;
-      if(leftShift < 0)
-         leftShift = 0;
-      if(leftShift >= bars)
-         leftShift = bars - 1;
-      datetime leftTime = iTime(_Symbol, _Period, leftShift);
-      datetime previousDay = referenceDay - 86400;
-      datetime previousFirstClose = previousDay + FirstCloseHour * 3600;
-      if(leftTime > 0 && leftTime <= previousFirstClose)
-         referenceDay = previousDay;
-     }
-
-   return (referenceDay > 0);
+   int y=(month==12?year+1:year);
+   int m=(month==12?1:month+1);
+   datetime last=CivilTime(y,m,1)-86400;
+   MqlDateTime d={};TimeToStruct(last,d);
+   return d.day-d.day_of_week;
   }
 
-//+------------------------------------------------------------------+
-//| Delete only this indicator instance's chart objects.            |
-//+------------------------------------------------------------------+
-void DeleteLevels()
+int BerlinOffsetAtUTC(datetime utc)
   {
-   if(g_firstObject != "")
-      ObjectDelete(0, g_firstObject);
-   if(g_secondObject != "")
-      ObjectDelete(0, g_secondObject);
+   MqlDateTime d={};TimeToStruct(utc,d);
+   datetime spring=CivilTime(d.year,3,LastSunday(d.year,3),1);
+   datetime autumn=CivilTime(d.year,10,LastSunday(d.year,10),1);
+   return (utc>=spring && utc<autumn)?7200:3600;
   }
 
-//+------------------------------------------------------------------+
-//| Build a finite horizontal segment FROM the closing time onward. |
-//+------------------------------------------------------------------+
-bool DrawLevel(const string name, const datetime endOfH1,
-               const double price, const color lineColor,
-               const ENUM_LINE_STYLE lineStyle,
-               const string levelType)
+// Session level times are 08-10; none falls in the DST overlap hour.
+datetime BerlinCivilToUTC(datetime berlinCivil)
   {
-   if(ObjectFind(0, name) >= 0)
-      return true;
+   datetime guess=berlinCivil-3600;
+   return berlinCivil-BerlinOffsetAtUTC(guess);
+  }
 
-   datetime endOfDay = g_activeDay + 86400 - 1;
-   if(endOfH1 >= endOfDay)
-      return false;
+int BrokerOffsetAtUTC(datetime utc)
+  {
+   if(BrokerUTCOffsetMode==OFFSET_MANUAL)
+      return (BrokerUsesEuropeanDST && BerlinOffsetAtUTC(utc)==7200 ?
+              BrokerSummerUTCOffsetHours:BrokerWinterUTCOffsetHours)*3600;
+   int adjust=0;
+   if(BrokerUsesEuropeanDST)
+      adjust=BerlinOffsetAtUTC(utc)-BerlinOffsetAtUTC(g_currentUTC);
+   return g_currentBrokerOffset+adjust;
+  }
 
-   ResetLastError();
-   if(!ObjectCreate(0, name, OBJ_TREND, 0,
-                    endOfH1, price, endOfDay, price))
+bool UpdateBrokerClock()
+  {
+   g_clockStatus=0;
+   if(TimeReference==LEVEL_BROKER_TIME)return true;
+
+   bool tester=(bool)MQLInfoInteger(MQL_TESTER);
+   if(BrokerUTCOffsetMode==OFFSET_AUTO_LIVE && tester)
      {
-      PrintFormat("H1 Volume Levels: cannot draw %s (error %d)",
-                  name, GetLastError());
+      g_clockStatus=1; // In Strategy Tester, GMT is simulated broker time.
       return false;
      }
 
-   ObjectSetInteger(0, name, OBJPROP_COLOR, lineColor);
-   ObjectSetInteger(0, name, OBJPROP_STYLE, lineStyle);
-   ObjectSetInteger(0, name, OBJPROP_WIDTH, LineWidth);
-   ObjectSetInteger(0, name, OBJPROP_RAY_LEFT, false);
-   ObjectSetInteger(0, name, OBJPROP_RAY_RIGHT, false);
-   ObjectSetInteger(0, name, OBJPROP_BACK, false);
-   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
-   ObjectSetInteger(0, name, OBJPROP_HIDDEN, false);
-   ObjectSetString(0, name, OBJPROP_TOOLTIP,
-                   StringFormat("H1 %s (%s close): %s",
-                                levelType,
-                                TimeToString(endOfH1, TIME_DATE | TIME_MINUTES),
-                                DoubleToString(price, _Digits)));
+   datetime brokerNow=tester?TimeCurrent():TimeTradeServer();
+   if(brokerNow<=0)return false;
+
+   if(BrokerUTCOffsetMode==OFFSET_MANUAL)
+     {
+      // Solve broker-UTC offset using a winter/summer fixed-point estimate.
+      datetime utc=brokerNow-BrokerWinterUTCOffsetHours*3600;
+      for(int i=0;i<3;i++)
+         utc=brokerNow-BrokerOffsetAtUTC(utc);
+      g_currentUTC=utc;
+      g_currentBrokerOffset=BrokerOffsetAtUTC(g_currentUTC);
+      return g_currentUTC>0;
+     }
+
+   datetime utcNow=TimeGMT();
+   if(utcNow<=0)return false;
+   int difference=(int)(brokerNow-utcNow);
+   int rounded=(int)MathRound((double)difference/900.0)*900;
+   if(MathAbs(difference-rounded)>120 || rounded<(-12*3600) || rounded>(14*3600))
+      return false;
+   g_currentUTC=utcNow;
+   g_currentBrokerOffset=rounded;
    return true;
   }
 
-//+------------------------------------------------------------------+
-//| Choose the H1 HIGH if bullish, or LOW if bearish.                |
-//+------------------------------------------------------------------+
-bool DrawH1DirectionalLevel(const int closeHour, const string objectName,
-                        const color lineColor,
-                        const ENUM_LINE_STYLE lineStyle,
-                        const datetime asOf)
+// Reference date is a *broker* day, so levels end at the MT5 day separator.
+// Convert that day's broker noon to Berlin noon to select the intended date.
+datetime CloseTimeInBrokerClock(datetime referenceBrokerDay,int closeHour)
   {
-   if(ObjectFind(0, objectName) >= 0)
-      return false;
+   if(TimeReference==LEVEL_BROKER_TIME)
+      return referenceBrokerDay+closeHour*3600;
 
-   // For a 09:00 CLOSE, the H1 candle opened at 08:00.
-   datetime barEnd = g_activeDay + closeHour * 3600;
-   datetime barOpen = barEnd - PeriodSeconds(PERIOD_H1);
-   if(asOf < barEnd)
-      return false;
+   datetime brokerNoon=referenceBrokerDay+12*3600;
+   datetime utcNoon=brokerNoon-g_currentBrokerOffset;
+   for(int i=0;i<3;i++)
+      utcNoon=brokerNoon-BrokerOffsetAtUTC(utcNoon);
 
-   MqlRates h1[];
-   int copied = CopyRates(_Symbol, PERIOD_H1, barOpen, barOpen, h1);
-   if(copied != 1 || h1[0].time != barOpen)
-      return false;
-
-   // Bar must no longer be the still-forming H1 candle.
-   if(iBarShift(_Symbol, PERIOD_H1, barOpen, true) < 1)
-      return false;
-
-   // Price action is determined by the real H1 open/close, not by
-   // the chart's candle colors or by the current chart timeframe.
-   // Bullish: line at the highest wick. Bearish: line at lowest wick.
-   // Doji: no directional level; leave the chart clear for that candle.
-   if(h1[0].close > h1[0].open)
-      return DrawLevel(objectName, barEnd, h1[0].high,
-                       lineColor, lineStyle, "bullish HIGH");
-   if(h1[0].close < h1[0].open)
-      return DrawLevel(objectName, barEnd, h1[0].low,
-                       lineColor, lineStyle, "bearish LOW");
-   return false;
+   datetime berlinNoon=utcNoon+BerlinOffsetAtUTC(utcNoon);
+   datetime berlinDay=DayStart(berlinNoon);
+   datetime closingUTC=BerlinCivilToUTC(berlinDay+closeHour*3600);
+   return closingUTC+BrokerOffsetAtUTC(closingUTC);
   }
 
-//+------------------------------------------------------------------+
-//| Update both levels on price ticks, scrolling, and a timer.       |
-//+------------------------------------------------------------------+
+int ClosingHour(int index)
+  {
+   if(index==0)return FirstCloseHour;
+   if(index==1)return SecondCloseHour;
+   return ThirdCloseHour;
+  }
+
+string LevelText(int index)
+  {
+   if(index==0)return FirstLevelText;
+   if(index==1)return SecondLevelText;
+   return ThirdLevelText;
+  }
+
+color LevelColor(int index)
+  {
+   if(index==0)return FirstLineColor;
+   if(index==1)return SecondLineColor;
+   return ThirdLineColor;
+  }
+
+ENUM_LINE_STYLE LevelStyle(int index)
+  {
+   if(index==0)return FirstLineStyle;
+   if(index==1)return SecondLineStyle;
+   return ThirdLineStyle;
+  }
+
+bool GetReference(datetime &referenceDay,datetime &asOf)
+  {
+   referenceDay=0;asOf=0;
+   datetime now=TimeTradeServer();
+   if(now<=0)now=TimeCurrent();
+   if(DayMode==BROKER_TODAY)
+     {
+      referenceDay=DayStart(now);
+      asOf=now;
+      return referenceDay>0 && asOf>0;
+     }
+
+   long leftmost=ChartGetInteger(0,CHART_FIRST_VISIBLE_BAR,0);
+   long visible=ChartGetInteger(0,CHART_VISIBLE_BARS,0);
+   int shift=0;
+   if(leftmost>=0 && visible>0)
+     {
+      long rightmost=leftmost-visible+1;
+      if(rightmost>0)shift=(int)rightmost;
+     }
+   int bars=Bars(_Symbol,_Period);
+   if(bars<=0)return false;
+   if(shift>=bars)shift=bars-1;
+
+   datetime rightTime=iTime(_Symbol,_Period,shift);
+   if(rightTime<=0)return false;
+   referenceDay=DayStart(rightTime);
+   int duration=PeriodSeconds(_Period);
+   if(duration<=0)duration=60;
+   asOf=rightTime+duration;
+   if(shift==0 && now>0 && now<asOf)asOf=now;
+
+   // When scrolling back just after midnight, still show yesterday if
+   // its first closing hour is also inside the visible chart area.
+   if(shift>0 && rightTime<CloseTimeInBrokerClock(referenceDay,FirstCloseHour))
+     {
+      int leftShift=(int)leftmost;
+      if(leftShift<0)leftShift=0;
+      if(leftShift>=bars)leftShift=bars-1;
+      datetime leftTime=iTime(_Symbol,_Period,leftShift);
+      datetime prevDay=referenceDay-86400;
+      datetime firstPrev=CloseTimeInBrokerClock(prevDay,FirstCloseHour);
+      if(leftTime>0 && leftTime<=firstPrev)referenceDay=prevDay;
+     }
+   return referenceDay>0;
+  }
+
+void DeleteLevels()
+  {
+   for(int i=0;i<3;i++)
+     {
+      if(g_levelNames[i]!="")ObjectDelete(0,g_levelNames[i]);
+      if(g_labelNames[i]!="")ObjectDelete(0,g_labelNames[i]);
+     }
+  }
+
+bool DrawLevel(int index,datetime closingServerTime,double price,string type)
+  {
+   datetime lineEnd=DayStart(closingServerTime)+86400-1;
+   if(closingServerTime<=0 || closingServerTime>=lineEnd)return false;
+   string line=g_levelNames[index];
+   if(ObjectFind(0,line)<0)
+     {
+      ResetLastError();
+      if(!ObjectCreate(0,line,OBJ_TREND,0,closingServerTime,price,lineEnd,price))
+        {
+         PrintFormat("H1 Volume Levels: cannot draw line (%d)",GetLastError());
+         return false;
+        }
+     }
+   ObjectSetInteger(0,line,OBJPROP_COLOR,LevelColor(index));
+   ObjectSetInteger(0,line,OBJPROP_STYLE,LevelStyle(index));
+   ObjectSetInteger(0,line,OBJPROP_WIDTH,
+                    LevelStyle(index)==STYLE_SOLID?LineWidth:1);
+   ObjectSetInteger(0,line,OBJPROP_RAY_LEFT,false);
+   ObjectSetInteger(0,line,OBJPROP_RAY_RIGHT,false);
+   ObjectSetInteger(0,line,OBJPROP_BACK,false);
+   ObjectSetInteger(0,line,OBJPROP_SELECTABLE,false);
+   ObjectSetInteger(0,line,OBJPROP_HIDDEN,true);
+   ObjectSetString(0,line,OBJPROP_TOOLTIP,
+                   StringFormat("H1 %s at %s: %s",type,
+                                TimeToString(closingServerTime,TIME_DATE|TIME_MINUTES),
+                                DoubleToString(price,_Digits)));
+
+   string label=g_labelNames[index];
+   string caption=LevelText(index);
+   if(!ShowLevelText || caption=="")
+     {
+      ObjectDelete(0,label);
+      return true;
+     }
+   datetime labelTime=closingServerTime+300;
+   if(labelTime>=lineEnd)labelTime=closingServerTime;
+   if(ObjectFind(0,label)<0)
+     {
+      if(!ObjectCreate(0,label,OBJ_TEXT,0,labelTime,price))return true;
+     }
+   else ObjectMove(0,label,0,labelTime,price);
+   ObjectSetString(0,label,OBJPROP_TEXT,caption);
+   ObjectSetString(0,label,OBJPROP_FONT,"Arial");
+   ObjectSetInteger(0,label,OBJPROP_FONTSIZE,TextFontSize);
+   ObjectSetInteger(0,label,OBJPROP_COLOR,LevelColor(index));
+   ObjectSetInteger(0,label,OBJPROP_ANCHOR,ANCHOR_LEFT_LOWER);
+   ObjectSetInteger(0,label,OBJPROP_SELECTABLE,false);
+   ObjectSetInteger(0,label,OBJPROP_HIDDEN,true);
+   return true;
+  }
+
+bool DrawH1DirectionalLevel(int index,datetime asOf)
+  {
+   if(ObjectFind(0,g_levelNames[index])>=0)return false;
+   datetime barEnd=CloseTimeInBrokerClock(g_activeDay,ClosingHour(index));
+   datetime barOpen=barEnd-PeriodSeconds(PERIOD_H1);
+   if(barEnd<=0 || asOf<barEnd)return false;
+   MqlRates h1[];
+   int copied=CopyRates(_Symbol,PERIOD_H1,barOpen,barOpen,h1);
+   if(copied!=1 || h1[0].time!=barOpen)return false;
+   if(iBarShift(_Symbol,PERIOD_H1,barOpen,true)<1)return false;
+   if(h1[0].close>h1[0].open)
+      return DrawLevel(index,barEnd,h1[0].high,"bullish HIGH");
+   if(h1[0].close<h1[0].open)
+      return DrawLevel(index,barEnd,h1[0].low,"bearish LOW");
+   return false; // Doji: no directional line.
+  }
+
 void UpdateLevels()
   {
-   datetime day, asOf;
-   if(!GetReference(day, asOf))
+   if(!UpdateBrokerClock())
+     {
+      if(g_clockStatus==1)Print("H1 Volume Levels: tester requires MANUAL broker UTC offset.");
       return;
-
-   bool changed = false;
-   if(day != g_activeDay)
+     }
+   datetime referenceDay=0,asOf=0;
+   if(!GetReference(referenceDay,asOf))return;
+   bool changed=false;
+   if(referenceDay!=g_activeDay)
      {
       DeleteLevels();
-      g_activeDay = day;
-      changed = true;
+      g_activeDay=referenceDay;
+      changed=true;
      }
-
-   if(DrawH1DirectionalLevel(FirstCloseHour, g_firstObject,
-                         FirstLineColor, FirstLineStyle, asOf))
-      changed = true;
-   if(DrawH1DirectionalLevel(SecondCloseHour, g_secondObject,
-                         SecondLineColor, SecondLineStyle, asOf))
-      changed = true;
-
-   if(changed)
-      ChartRedraw(0);
+   for(int i=0;i<3;i++)
+      if(DrawH1DirectionalLevel(i,asOf))changed=true;
+   if(changed)ChartRedraw(0);
   }
 
-//+------------------------------------------------------------------+
-//| MQL5 indicator event handlers                                    |
-//+------------------------------------------------------------------+
 int OnInit()
   {
-   if(FirstCloseHour < 1 || FirstCloseHour > 23 ||
-      SecondCloseHour < 1 || SecondCloseHour > 23 ||
-      FirstCloseHour == SecondCloseHour ||
-      LineWidth < 1 || LineWidth > 5)
+   if(FirstCloseHour<1 || FirstCloseHour>23 ||
+      SecondCloseHour<1 || SecondCloseHour>23 ||
+      ThirdCloseHour<1 || ThirdCloseHour>23 ||
+      FirstCloseHour==SecondCloseHour ||
+      FirstCloseHour==ThirdCloseHour ||
+      SecondCloseHour==ThirdCloseHour ||
+      BrokerWinterUTCOffsetHours< -12 || BrokerWinterUTCOffsetHours>14 ||
+      BrokerSummerUTCOffsetHours< -12 || BrokerSummerUTCOffsetHours>14 ||
+      LineWidth<1 || LineWidth>5 || TextFontSize<6 || TextFontSize>36)
      {
-      Print("H1 Volume Levels: hours must be different (1..23); width 1..5.");
+      Print("H1 Volume Levels: invalid inputs (hours 1-23, distinct, width 1-5).");
       return INIT_PARAMETERS_INCORRECT;
      }
-
-   string prefix = "H1VolumeLevels_" +
-                   IntegerToString(ChartID()) + "_" +
-                   IntegerToString((long)GetTickCount()) + "_";
-   g_firstObject  = prefix + IntegerToString(FirstCloseHour);
-   g_secondObject = prefix + IntegerToString(SecondCloseHour);
-
-   // Deliberately do NOT set INDICATOR_SHORTNAME here.
-   // MT5 then uses the filename 'H1 Volume Levels' and avoids displaying
-   // an additional short-name suffix in parentheses in the Indicators List.
-
+   string prefix="H1VolumeLevels_"+IntegerToString(ChartID())+"_"+
+                 IntegerToString((long)GetTickCount())+"_";
+   for(int i=0;i<3;i++)
+     {
+      g_levelNames[i]=prefix+"LINE_"+IntegerToString(i+1);
+      g_labelNames[i]=prefix+"TEXT_"+IntegerToString(i+1);
+     }
+   // No INDICATOR_SHORTNAME: Indicators List displays only H1 Volume Levels.
    EventSetTimer(2);
    UpdateLevels();
    return INIT_SUCCEEDED;
@@ -290,31 +390,21 @@ void OnDeinit(const int reason)
    ChartRedraw(0);
   }
 
-void OnTimer()
+void OnTimer(){UpdateLevels();}
+
+void OnChartEvent(const int id,const long &lparam,
+                  const double &dparam,const string &sparam)
   {
-   UpdateLevels();
+   if(id==CHARTEVENT_CHART_CHANGE)UpdateLevels();
   }
 
-void OnChartEvent(const int id, const long &lparam,
-                  const double &dparam, const string &sparam)
+int OnCalculate(const int rates_total,const int prev_calculated,
+                const datetime &time[],const double &open[],
+                const double &high[],const double &low[],
+                const double &close[],const long &tick_volume[],
+                const long &volume[],const int &spread[])
   {
-   if(id == CHARTEVENT_CHART_CHANGE)
-      UpdateLevels();
-  }
-
-int OnCalculate(const int rates_total,
-                const int prev_calculated,
-                const datetime &time[],
-                const double &open[],
-                const double &high[],
-                const double &low[],
-                const double &close[],
-                const long &tick_volume[],
-                const long &volume[],
-                const int &spread[])
-  {
-   if(rates_total > 0)
-      UpdateLevels();
+   if(rates_total>0)UpdateLevels();
    return rates_total;
   }
 //+------------------------------------------------------------------+
