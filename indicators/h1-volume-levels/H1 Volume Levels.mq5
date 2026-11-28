@@ -12,7 +12,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright (c) 2026 Enrique Briceno"
 #property link      "https://github.com/enr1quecido/trading-tools"
-#property version   "1.26"
+#property version   "1.27"
 #property description "H1 Volume Levels by Enrique Briceno"
 #property strict
 #property indicator_chart_window
@@ -66,7 +66,6 @@ input ENUM_LINE_STYLE ThirdLineStyle = STYLE_DOT;
 input group "Appearance"
 input bool ShowLevelText = true;                // Show or hide all three text labels
 input int TextFontSize = 9;
-input int LabelRightMarginPx = 72;            // Pixels from chart right edge (includes price scale)
 input int LineWidth = 1;                       // Non-solid MT5 lines use width 1
 
 string g_instancePrefix="";
@@ -276,7 +275,7 @@ void CleanLegacyH1Objects()
    previous+=ObjectsDeleteAll(0,"H1CloseLevels_",0,-1);
    previous+=ObjectsDeleteAll(0,"H1VLevels126_",0,-1);
    if(previous>0)
-      PrintFormat("H1 Volume Levels v1.26: removed %d orphaned legacy objects",previous);
+      PrintFormat("H1 Volume Levels v1.27: removed %d orphaned legacy objects",previous);
   }
 
 bool DrawLevel(int index,datetime closingServerTime,double price,string type)
@@ -307,14 +306,14 @@ bool DrawLevel(int index,datetime closingServerTime,double price,string type)
                                 TimeToString(closingServerTime,TIME_DATE|TIME_MINUTES),
                                 DoubleToString(price,_Digits)));
 
-   // Label placement is handled separately in PositionPriceLabel().
-   // OBJ_LABEL is pixel-anchored, not tied to a historical candle time.
+   // Label placement is handled separately by PositionPriceLabel().
+   // It uses OBJ_TEXT anchored to chart time and price, not screen pixels.
    return true;
   }
 
-// Position a label at the right edge of the CURRENT chart, directly above
-// its level. Convert the LEVEL PRICE to a screen Y coordinate using MT5.
-// Unlike OBJ_TEXT, OBJ_LABEL cannot jump back to the candle's left edge.
+// Attach each caption to its level one minute before BROKER midnight.
+// OBJ_TEXT follows chart time/price when scrolling or zooming.
+// ANCHOR_RIGHT_LOWER keeps all text to the LEFT and ABOVE the line end.
 bool PositionPriceLabel(const int index)
   {
    string line=g_levelNames[index];
@@ -322,58 +321,53 @@ bool PositionPriceLabel(const int index)
    string caption=LevelText(index);
    if(!ShowLevelText || caption=="" || ObjectFind(0,line)<0)
      {
-      if(ObjectFind(0,label)>=0)ObjectDelete(0,label);
+      if(ObjectFind(0,label)>=0)
+         return ObjectDelete(0,label);
       return false;
      }
 
-   int totalBars=Bars(_Symbol,_Period);
-   if(totalBars<=0)return false;
-   long firstVisible=ChartGetInteger(0,CHART_FIRST_VISIBLE_BAR,0);
-   if(firstVisible<0)firstVisible=0;
-   if(firstVisible>=totalBars)firstVisible=totalBars-1;
-   datetime visibleTime=iTime(_Symbol,_Period,(int)firstVisible);
-   if(visibleTime<=0)return false;
+   datetime lineStart=(datetime)ObjectGetInteger(0,line,OBJPROP_TIME,0);
+   datetime lineEnd=(datetime)ObjectGetInteger(0,line,OBJPROP_TIME,1);
+   if(lineStart<=0 || lineEnd<=lineStart)return false;
 
-   double price=ObjectGetDouble(0,line,OBJPROP_PRICE,0);
-   int x=0,y=0;
-   if(!ChartTimePriceToXY(0,0,visibleTime,price,x,y))
-     {
-      if(ObjectFind(0,label)>=0)ObjectDelete(0,label);
-      return false;
-     }
+   // The trendline's endpoint is the current BROKER day at 23:59:59.
+   // Place the label one minute before it, independent of viewport position.
+   datetime labelTime=lineEnd-60;
+   if(labelTime<=lineStart)labelTime=lineStart+1;
+   if(labelTime>=lineEnd)return false;
 
-   // Avoid showing labels off-screen when their price level is not visible.
-   long height=ChartGetInteger(0,CHART_HEIGHT_IN_PIXELS,0);
-   if(height<=0 || y<5 || y>=(int)height-5)
-     {
-      if(ObjectFind(0,label)>=0)ObjectDelete(0,label);
-      return false;
-     }
-
+   double levelPrice=ObjectGetDouble(0,line,OBJPROP_PRICE,0);
+   bool changed=false;
    if(ObjectFind(0,label)<0)
      {
       ResetLastError();
-      if(!ObjectCreate(0,label,OBJ_LABEL,0,0,0))
+      if(!ObjectCreate(0,label,OBJ_TEXT,0,labelTime,levelPrice))
         {
-         PrintFormat("H1 Volume Levels: label creation failed (%d)",GetLastError());
+         PrintFormat("H1 Volume Levels: cannot create level label (%d)",GetLastError());
          return false;
+        }
+      changed=true;
+     }
+   else
+     {
+      datetime previousTime=(datetime)ObjectGetInteger(0,label,OBJPROP_TIME,0);
+      double previousPrice=ObjectGetDouble(0,label,OBJPROP_PRICE,0);
+      if(previousTime!=labelTime || MathAbs(previousPrice-levelPrice)>_Point*0.1)
+        {
+         if(!ObjectMove(0,label,0,labelTime,levelPrice))return false;
+         changed=true;
         }
      }
 
-   int top=y-3;
-   if(top<0)top=0;
-   ObjectSetInteger(0,label,OBJPROP_CORNER,CORNER_RIGHT_UPPER);
-   ObjectSetInteger(0,label,OBJPROP_ANCHOR,ANCHOR_RIGHT_LOWER);
-   ObjectSetInteger(0,label,OBJPROP_XDISTANCE,LabelRightMarginPx);
-   ObjectSetInteger(0,label,OBJPROP_YDISTANCE,top);
    ObjectSetString(0,label,OBJPROP_TEXT,caption);
    ObjectSetString(0,label,OBJPROP_FONT,"Arial");
    ObjectSetInteger(0,label,OBJPROP_FONTSIZE,TextFontSize);
    ObjectSetInteger(0,label,OBJPROP_COLOR,LevelColor(index));
+   ObjectSetInteger(0,label,OBJPROP_ANCHOR,ANCHOR_RIGHT_LOWER);
    ObjectSetInteger(0,label,OBJPROP_BACK,false);
    ObjectSetInteger(0,label,OBJPROP_SELECTABLE,false);
    ObjectSetInteger(0,label,OBJPROP_HIDDEN,true);
-   return true;
+   return changed;
   }
 
 bool DrawH1DirectionalLevel(int index,datetime asOf)
@@ -427,15 +421,14 @@ int OnInit()
       SecondCloseHour==ThirdCloseHour ||
       BrokerWinterUTCOffsetHours< -12 || BrokerWinterUTCOffsetHours>14 ||
       BrokerSummerUTCOffsetHours< -12 || BrokerSummerUTCOffsetHours>14 ||
-      LineWidth<1 || LineWidth>5 || TextFontSize<6 || TextFontSize>36 ||
-      LabelRightMarginPx<0 || LabelRightMarginPx>500)
+      LineWidth<1 || LineWidth>5 || TextFontSize<6 || TextFontSize>36)
      {
       Print("H1 Volume Levels: invalid inputs (hours 1-23, distinct, width 1-5).");
       return INIT_PARAMETERS_INCORRECT;
      }
    CleanLegacyH1Objects();
    // Unique prefix for this running instance. OnDeinit deletes ALL its objects.
-   g_instancePrefix="H1VLevels126_"+IntegerToString(ChartID())+"_"+
+   g_instancePrefix="H1VLevels127_"+IntegerToString(ChartID())+"_"+
                     IntegerToString((long)GetTickCount())+"_";
    for(int i=0;i<3;i++)
      {
